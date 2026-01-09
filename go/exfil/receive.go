@@ -6,166 +6,309 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"os"
-	"sort"
+	"strings"
 	"sync"
-	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
-func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int) {
-	fmt.Println("\033[33m--- DNS TTL Recovery (Go) ---\033[0m")
-	fmt.Printf("\033[32m[+]\033[0m UUID: \033[32m%s\033[0m\n", shortUUID)
+type bitRecoveredMsg struct {
+	pos int
+	val int
+}
 
-	startTime := time.Now()
-	requestCount := 0
+type receiveModel struct {
+	cfg          config.Config
+	shortUUID    string
+	expectedLen  int
+	recovered    []byte
+	bitStatus    []bool
+	bitsFinished int
+	totalBits    int
+	done         bool
+	headerReady  bool
+	width        int
+	
+	crcEnabled   bool
+	blockStatus  []int // 0: Pending, 1: OK, 2: Corrupt
+}
 
-	// 1. Determine Baseline TTL
-	baselineQuery := fmt.Sprintf("baseline.%s.%s", shortUUID, cfg.Domain)
-	baselineTTL, err := utils.QueryTTL(baselineQuery, cfg.Resolver)
-	requestCount++
-	if err != nil {
-		fmt.Printf("\033[31m[!!]\033[0m Error: Could not determine baseline TTL: %v\n", err)
-		return
-	}
+func (m *receiveModel) Init() tea.Cmd {
+	return nil
+}
 
-	// 2. Determine END marker TTL
-	endQuery := fmt.Sprintf("end.%s.%s", shortUUID, cfg.Domain)
-	endTTL, err := utils.QueryTTL(endQuery, cfg.Resolver)
-	requestCount++
-	if err != nil {
-		fmt.Println("\033[33m[-]\033[0m Warning: END marker not found. Falling back to Baseline TTL comparison.")
-		endTTL = baselineTTL
-	}
-
-	fmt.Printf("\033[32m[+]\033[0m Baseline TTL: %d\n", baselineTTL)
-	fmt.Printf("\033[32m[+]\033[0m End Marker TTL: %d\n", endTTL)
-
-	// 3. Recover Header (3 bytes: Options + 2-byte Length)
-	headerBytes := recoverBytes(cfg, shortUUID, 0, 3, endTTL, concurrency, &requestCount, false)
-	if len(headerBytes) < 3 {
-		fmt.Println("\033[31m[!!]\033[0m Error: Failed to recover header")
-		return
-	}
-
-	options := headerBytes[0]
-	expectedLen := int(binary.BigEndian.Uint16(headerBytes[1:3]))
-	crcEnabled := (options & (1 << 2)) != 0
-
-	fmt.Printf("\033[32m[+]\033[0m Options: 0x%02x (CRC32: %v)\n", options, crcEnabled)
-	fmt.Printf("\033[32m[+]\033[0m Message Length: %d bytes\n", expectedLen)
-	fmt.Println("-------------------------------------")
-
-	var finalMessage []byte
-	currentBytePos := 3
-	var blockStatuses []string
-
-	for len(finalMessage) < expectedLen {
-		remaining := expectedLen - len(finalMessage)
-		chunkSize := 256
-		if remaining < chunkSize {
-			chunkSize = remaining
+func (m *receiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+	case int: // Header ready signal
+		m.expectedLen = msg
+		m.crcEnabled = (m.recovered[0] & (1 << 2)) != 0
+		
+		totalBytes := m.expectedLen + 3
+		if m.crcEnabled {
+			// Add space for CRCs (4 bytes per 256 bytes of data)
+			numBlocks := (m.expectedLen + 255) / 256
+			totalBytes += numBlocks * 4
+			m.blockStatus = make([]int, numBlocks)
 		}
 
-		// Recover Data Chunk
-		chunk := recoverBytes(cfg, shortUUID, currentBytePos, chunkSize, endTTL, concurrency, &requestCount, true)
-		currentBytePos += chunkSize
+		m.totalBits = totalBytes * 8
+		
+		newRecovered := make([]byte, totalBytes)
+		copy(newRecovered, m.recovered)
+		m.recovered = newRecovered
 
-		if crcEnabled {
-			// Recover CRC32 (4 bytes)
-			recoveredCRCBytes := recoverBytes(cfg, shortUUID, currentBytePos, 4, endTTL, concurrency, &requestCount, false)
-			currentBytePos += 4
+		newBitStatus := make([]bool, m.totalBits)
+		copy(newBitStatus, m.bitStatus)
+		m.bitStatus = newBitStatus
 
-			if len(recoveredCRCBytes) == 4 {
-				recoveredCRC := binary.BigEndian.Uint32(recoveredCRCBytes)
-				actualCRC := crc32.ChecksumIEEE(chunk)
+		m.headerReady = true
+	case bitRecoveredMsg:
+		if msg.pos >= len(m.bitStatus) {
+			return m, nil
+		}
+		m.bitStatus[msg.pos] = true
+		m.bitsFinished++
+		
+		bytePos := msg.pos / 8
+		bitIdx := msg.pos % 8
+		if msg.val == 1 {
+			m.recovered[bytePos] |= (1 << (7 - bitIdx))
+		}
 
-				if recoveredCRC == actualCRC {
-					blockStatuses = append(blockStatuses, fmt.Sprintf("\033[32m[OK]\033[0m Block %d-%d", len(finalMessage), len(finalMessage)+len(chunk)))
-				} else {
-					blockStatuses = append(blockStatuses, fmt.Sprintf("\033[31m[FAIL]\033[0m Block %d-%d", len(finalMessage), len(finalMessage)+len(chunk)))
+		// Live CRC Verification
+		if m.headerReady && m.crcEnabled {
+			numBlocks := len(m.blockStatus)
+			crcStart := 3
+			dataStart := 3 + (numBlocks * 4)
+
+			// Check if we are in the data section
+			if bytePos >= dataStart {
+				relativeDataPos := bytePos - dataStart
+				blockIdx := relativeDataPos / 256
+				
+				if blockIdx < numBlocks {
+					// Check if this block is now fully recovered
+					startByte := dataStart + (blockIdx * 256)
+					dataLen := 256
+					if blockIdx == numBlocks-1 {
+						dataLen = m.expectedLen % 256
+						if dataLen == 0 {
+							dataLen = 256
+						}
+					}
+
+					// Check all bits for data AND the corresponding CRC
+					allReady := true
+					// Check data bits
+					for b := 0; b < dataLen; b++ {
+						for bit := 0; bit < 8; bit++ {
+							if !m.bitStatus[(startByte+b)*8+bit] {
+								allReady = false
+								break
+							}
+						}
+						if !allReady { break }
+					}
+					// Check CRC bits
+					if allReady {
+						crcByteStart := crcStart + (blockIdx * 4)
+						for b := 0; b < 4; b++ {
+							for bit := 0; bit < 8; bit++ {
+								if !m.bitStatus[(crcByteStart+b)*8+bit] {
+									allReady = false
+									break
+								}
+							}
+							if !allReady { break }
+						}
+					}
+
+					if allReady && m.blockStatus[blockIdx] == 0 {
+						data := m.recovered[startByte : startByte+dataLen]
+						crcByteStart := crcStart + (blockIdx * 4)
+						expectedCRC := binary.BigEndian.Uint32(m.recovered[crcByteStart : crcByteStart+4])
+						actualCRC := crc32.ChecksumIEEE(data)
+						
+						if actualCRC == expectedCRC {
+							m.blockStatus[blockIdx] = 1
+						} else {
+							m.blockStatus[blockIdx] = 2
+						}
+					}
 				}
 			}
 		}
 
-		finalMessage = append(finalMessage, chunk...)
-	}
-
-	if !cfg.Debug {
-		fmt.Println()
-	}
-
-	if crcEnabled {
-		fmt.Println("\n--- Integrity Summary ---")
-		for _, status := range blockStatuses {
-			fmt.Println(status)
+		if m.headerReady && m.bitsFinished == m.totalBits {
+			m.done = true
+			return m, tea.Quit
+		}
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" || msg.String() == "q" {
+			return m, tea.Quit
 		}
 	}
-
-	duration := time.Since(startTime)
-	if !cfg.Debug {
-		fmt.Println()
-	}
-	fmt.Println("-------------------------------------")
-	fmt.Printf("\033[32m[+]\033[0m Time taken: %.3f seconds\n", duration.Seconds())
-	fmt.Printf("\033[32m[+]\033[0m Bytes recovered: %d\n", len(finalMessage))
-	fmt.Printf("\033[32m[+]\033[0m DNS Requests: %d\n", requestCount)
-	if duration.Seconds() > 0 {
-		fmt.Printf("\033[32m[+]\033[0m Average speed: %.2f bytes/sec\n", float64(len(finalMessage))/duration.Seconds())
-	}
+	return m, nil
 }
 
-func recoverBytes(cfg config.Config, shortUUID string, startByte int, numBytes int, endTTL int, concurrency int, requestCount *int, stream bool) []byte {
-	recovered := make([]byte, numBytes)
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrency)
+func (m *receiveModel) View() string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("\n[+] UUID: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(m.shortUUID)))
 
-	type bitResult struct {
-		pos int
-		val int
+	if !m.headerReady {
+		b.WriteString("[*] Recovering header...\n")
+		return b.String()
 	}
-	resultsChan := make(chan bitResult, numBytes*8)
 
-	for i := 0; i < numBytes*8; i++ {
-		wg.Add(1)
-		bitPos := startByte*8 + i
-		go func(pos int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+	b.WriteString(fmt.Sprintf("[+] Message Length: %d bytes (CRC: %v)\n\n", m.expectedLen, m.crcEnabled))
 
-			query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
-			currentTTL, err := utils.QueryTTL(query, cfg.Resolver)
-			val := 0
-			if err == nil && currentTTL <= endTTL {
-				val = 1
+	currentLineLen := 0
+	numBlocks := 0
+	if m.crcEnabled {
+		numBlocks = (m.expectedLen + 255) / 256
+	}
+	dataIdx := 3 + (numBlocks * 4)
+	bytesDisplayed := 0
+	for dataIdx < len(m.recovered) && bytesDisplayed < m.expectedLen {
+		blockIdx := 0
+		if m.crcEnabled {
+			blockIdx = (dataIdx - (3 + numBlocks*4)) / 256
+		}
+
+		if true {
+			bytesDisplayed++
+			allBitsReady := true
+			for j := 0; j < 8; j++ {
+				bitPos := dataIdx*8 + j
+				if bitPos >= len(m.bitStatus) || !m.bitStatus[bitPos] {
+					allBitsReady = false
+					break
+				}
 			}
-			resultsChan <- bitResult{pos: pos, val: val}
-		}(bitPos)
+
+			charStr := ""
+			if allBitsReady {
+				charStr = string(m.recovered[dataIdx])
+			} else {
+				charStr = "░"
+			}
+
+			style := lipgloss.NewStyle()
+			if m.crcEnabled {
+				status := m.blockStatus[blockIdx]
+				switch status {
+				case 0: // Pending
+					style = style.Foreground(lipgloss.Color("11")) // Yellow
+				case 1: // OK
+					style = style.Foreground(lipgloss.Color("10")) // Green
+				case 2: // Corrupt
+					style = style.Foreground(lipgloss.Color("9"))  // Red
+				}
+			} else {
+				style = style.Foreground(lipgloss.Color("240")) // Dim for placeholders
+				if allBitsReady {
+					style = lipgloss.NewStyle() // Default
+				}
+			}
+
+			renderedChar := style.Render(charStr)
+			if m.width > 0 && currentLineLen >= m.width-1 {
+				b.WriteString("\n")
+				currentLineLen = 0
+			}
+			b.WriteString(renderedChar)
+			currentLineLen++
+		}
+		dataIdx++
 	}
 
-	wg.Wait()
-	close(resultsChan)
-	*requestCount += numBytes * 8
-
-	bits := make([]bitResult, 0, numBytes*8)
-	for res := range resultsChan {
-		bits = append(bits, res)
+	b.WriteString(fmt.Sprintf("\n\nProgress: %d/%d bits recovered\n", m.bitsFinished, m.totalBits))
+	if m.done {
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("\n[+] Recovery Complete!\n"))
 	}
-	sort.Slice(bits, func(i, j int) bool {
-		return bits[i].pos < bits[j].pos
-	})
+	return b.String()
+}
 
-	for i := 0; i < numBytes; i++ {
-		var b byte
-		for j := 0; j < 8; j++ {
-			if bits[i*8+j].val == 1 {
-				b |= (1 << (7 - j))
+func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int) {
+	m := &receiveModel{
+		cfg:         cfg,
+		shortUUID:   shortUUID,
+		recovered:   make([]byte, 3),
+		bitStatus:   make([]bool, 24),
+		totalBits:   24,
+	}
+	p := tea.NewProgram(m)
+
+	go func() {
+		baselineQuery := fmt.Sprintf("baseline.%s.%s", shortUUID, cfg.Domain)
+		baselineTTL, _ := utils.QueryTTL(baselineQuery, cfg.Resolver)
+		
+		endQuery := fmt.Sprintf("end.%s.%s", shortUUID, cfg.Domain)
+		endTTL, err := utils.QueryTTL(endQuery, cfg.Resolver)
+		if err != nil {
+			endTTL = baselineTTL
+		}
+
+		var hWg sync.WaitGroup
+		headerBits := make([]int, 24)
+		for i := 0; i < 24; i++ {
+			hWg.Add(1)
+			go func(pos int) {
+				defer hWg.Done()
+				query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
+				ttl, err := utils.QueryTTL(query, cfg.Resolver)
+				val := 0
+				if err == nil && ttl <= endTTL {
+					val = 1
+				}
+				headerBits[pos] = val
+				p.Send(bitRecoveredMsg{pos: pos, val: val})
+			}(i)
+		}
+		hWg.Wait()
+
+		headerBytes := make([]byte, 3)
+		for i := 0; i < 24; i++ {
+			if headerBits[i] == 1 {
+				headerBytes[i/8] |= (1 << (7 - (i % 8)))
 			}
 		}
-		recovered[i] = b
-		if stream && !cfg.Debug {
-			os.Stdout.Write([]byte{b})
+		
+		expectedLen := int(binary.BigEndian.Uint16(headerBytes[1:3]))
+		crcEnabled := (headerBytes[0] & (1 << 2)) != 0
+		p.Send(expectedLen)
+
+		totalBytes := expectedLen + 3
+		if crcEnabled {
+			numBlocks := (expectedLen + 255) / 256
+			totalBytes += numBlocks * 4
 		}
+
+		sem := make(chan struct{}, concurrency)
+		var dWg sync.WaitGroup
+		for i := 24; i < totalBytes*8; i++ {
+			dWg.Add(1)
+			go func(pos int) {
+				defer dWg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
+				ttl, err := utils.QueryTTL(query, cfg.Resolver)
+				val := 0
+				if err == nil && ttl <= endTTL {
+					val = 1
+				}
+				p.Send(bitRecoveredMsg{pos: pos, val: val})
+			}(i)
+		}
+		dWg.Wait()
+	}()
+
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Error running program: %v", err)
 	}
-	return recovered
 }

@@ -1,7 +1,8 @@
 {
   "resolver": "192.168.1.1:53",
-  "domain": "web.app",
+  "domain": "synlace.io",
   "debug": false,
   "maxlen": 1024,
-  "options": 0
+  "options": 4,
+  "concurrency": 4
 }

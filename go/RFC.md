@@ -53,11 +53,12 @@ If Bit 2 of the Options Byte is set to `1`, the following integrity mechanism MU
 ### 5.1 Segmentation
 The message payload is divided into segments of **256 bytes**.
 
-### 5.2 Interleaved Checksums
+### 5.2 Checksum Placement
+All CRC32 checksums are placed immediately after the 3-byte header and before the message payload.
 For each 256-byte segment:
-1. The sender exfiltrates the 256 bytes of data.
-2. The sender immediately exfiltrates a 4-byte (32-bit) CRC32 checksum calculated for that specific segment.
-3. The final segment, if less than 256 bytes, is followed by a CRC32 calculated for the remaining bytes.
+1. A 4-byte (32-bit) CRC32 checksum is calculated.
+2. All calculated checksums are concatenated and transmitted after the Message Length bytes.
+3. The message payload segments are transmitted after all checksums.
 
 ### 5.3 Verification
 The receiver MUST calculate the CRC32 for each recovered 256-byte segment and compare it to the recovered checksum bits. If a mismatch occurs, the segment MUST be marked as corrupt.
