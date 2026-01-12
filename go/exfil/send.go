@@ -16,6 +16,7 @@ import (
 )
 
 type bitSentMsg int
+type statsReadyMsg struct{}
 
 type sendModel struct {
 	cfg          config.Config
@@ -25,6 +26,8 @@ type sendModel struct {
 	totalBits    int
 	bitsFinished int
 	startTime    time.Time
+	endTime      time.Time
+	decayTime    time.Duration
 	done         bool
 	width        int
 }
@@ -44,9 +47,11 @@ func (m *sendModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.bitsFinished++
 		}
 		if m.bitsFinished == m.totalBits {
-			m.done = true
-			return m, tea.Quit
+			// Wait for statsReadyMsg instead of quitting here
 		}
+	case statsReadyMsg:
+		m.done = true
+		return m, tea.Quit
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
@@ -105,6 +110,18 @@ func (m *sendModel) View() string {
 	b.WriteString(fmt.Sprintf("\n\nProgress: %d/%d bits triggered\n", m.bitsFinished, m.totalBits))
 	if m.done {
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("\n[+] Done!\n"))
+
+		duration := m.endTime.Sub(m.startTime)
+		bytesPerSec := float64(len(m.fullData)) / duration.Seconds()
+
+		b.WriteString("\nTransmission Statistics:\n")
+		b.WriteString(fmt.Sprintf("  Time Taken:    %.1fs\n", duration.Seconds()))
+		b.WriteString(fmt.Sprintf("  Bandwidth:     %.1f bytes/s\n", bytesPerSec))
+		
+		h := int(m.decayTime.Hours())
+		m_ := int(m.decayTime.Minutes()) % 60
+		s := int(m.decayTime.Seconds()) % 60
+		b.WriteString(fmt.Sprintf("  Decay Time:    %dh %dm %ds (Remaining in resolver cache)\n", h, m_, s))
 	}
 	return b.String()
 }
@@ -181,9 +198,36 @@ func Send(cfg config.Config, message string) {
 			}
 		}
 		wg.Wait()
+		m.endTime = time.Now()
 
 		endQuery := fmt.Sprintf("end.%s.%s", shortUUID, cfg.Domain)
 		utils.TriggerQuery(endQuery, cfg.Resolver)
+		
+		// To find the lowest TTL (first bit to expire), we check the first '1' bit sent
+		firstOnePos := -1
+		for i, b := range fullData {
+			bits := fmt.Sprintf("%08b", b)
+			for bitIdx, bit := range bits {
+				if bit == '1' {
+					firstOnePos = i*8 + bitIdx
+					break
+				}
+			}
+			if firstOnePos != -1 { break }
+		}
+
+		if firstOnePos != -1 {
+			query := fmt.Sprintf("%d.%s.%s", firstOnePos, shortUUID, cfg.Domain)
+			if ttl, err := utils.QueryTTL(query, cfg.Resolver); err == nil {
+				m.decayTime = time.Duration(ttl) * time.Second
+			}
+		} else {
+			// Fallback to end marker if no '1' bits (unlikely for real data)
+			if ttl, err := utils.QueryTTL(endQuery, cfg.Resolver); err == nil {
+				m.decayTime = time.Duration(ttl) * time.Second
+			}
+		}
+		p.Send(statsReadyMsg{})
 	}()
 
 	if _, err := p.Run(); err != nil {

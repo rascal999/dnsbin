@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"strings"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -26,6 +27,9 @@ type receiveModel struct {
 	bitStatus    []bool
 	bitsFinished int
 	totalBits    int
+	startTime    time.Time
+	endTime      time.Time
+	decayTime    time.Duration
 	done         bool
 	headerReady  bool
 	width        int
@@ -143,9 +147,11 @@ func (m *receiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.headerReady && m.bitsFinished == m.totalBits {
-			m.done = true
-			return m, tea.Quit
+			// Wait for statsReadyMsg
 		}
+	case statsReadyMsg:
+		m.done = true
+		return m, tea.Quit
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || msg.String() == "q" {
 			return m, tea.Quit
@@ -228,6 +234,18 @@ func (m *receiveModel) View() string {
 	b.WriteString(fmt.Sprintf("\n\nProgress: %d/%d bits recovered\n", m.bitsFinished, m.totalBits))
 	if m.done {
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("\n[+] Recovery Complete!\n"))
+
+		duration := m.endTime.Sub(m.startTime)
+		bytesPerSec := float64(len(m.recovered)) / duration.Seconds()
+
+		b.WriteString("\nRecovery Statistics:\n")
+		b.WriteString(fmt.Sprintf("  Time Taken:    %.1fs\n", duration.Seconds()))
+		b.WriteString(fmt.Sprintf("  Bandwidth:     %.1f bytes/s\n", bytesPerSec))
+		
+		h := int(m.decayTime.Hours())
+		m_ := int(m.decayTime.Minutes()) % 60
+		s := int(m.decayTime.Seconds()) % 60
+		b.WriteString(fmt.Sprintf("  Decay Time:    %dh %dm %ds (Until cache expiration)\n", h, m_, s))
 	}
 	return b.String()
 }
@@ -239,6 +257,7 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 		recovered:   make([]byte, 3),
 		bitStatus:   make([]bool, 24),
 		totalBits:   24,
+		startTime:   time.Now(),
 	}
 	p := tea.NewProgram(m)
 
@@ -306,6 +325,34 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 			}(i)
 		}
 		dWg.Wait()
+		m.endTime = time.Now()
+
+		// Find the lowest TTL among all recovered '1' bits
+		lowestTTL := -1
+		
+		// We check the header bits first
+		for i := 0; i < 24; i++ {
+			if headerBits[i] == 1 {
+				query := fmt.Sprintf("%d.%s.%s", i, shortUUID, cfg.Domain)
+				if ttl, err := utils.QueryTTL(query, cfg.Resolver); err == nil {
+					if lowestTTL == -1 || ttl < lowestTTL {
+						lowestTTL = ttl
+					}
+				}
+			}
+		}
+
+		// Then check a sample of data bits if needed, or just use the end marker as a proxy
+		if lowestTTL == -1 {
+			if ttl, err := utils.QueryTTL(endQuery, cfg.Resolver); err == nil {
+				lowestTTL = ttl
+			}
+		}
+
+		if lowestTTL != -1 {
+			m.decayTime = time.Duration(lowestTTL) * time.Second
+		}
+		p.Send(statsReadyMsg{})
 	}()
 
 	if _, err := p.Run(); err != nil {
