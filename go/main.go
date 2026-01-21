@@ -169,10 +169,10 @@ func main() {
 			exfil.Send(cfg, message)
 		case "receive":
 			if len(args) < 2 {
-				fmt.Print("\rUsage: receive <uuid> [max_chars] [concurrency]\r\n")
+				fmt.Print("\rUsage: receive <message_id> [max_chars] [concurrency]\r\n")
 				continue
 			}
-			uuid := args[1]
+			messageID := args[1]
 			maxChars := cfg.MaxLen
 			concurrency := cfg.Concurrency
 			if len(args) > 2 {
@@ -185,7 +185,7 @@ func main() {
 					concurrency = v
 				}
 			}
-			exfil.Receive(cfg, uuid, maxChars, concurrency)
+			exfil.Receive(cfg, messageID, maxChars, concurrency)
 		default:
 			fmt.Printf("\rUnknown command: %s. Type 'help' for available commands.\r\n", cmd)
 		}
@@ -200,7 +200,7 @@ func usage() {
 	fmt.Print("  set debug <true|false>   Enable or disable debug output\r\n")
 	fmt.Print("  show config              Display current domain and resolver settings\r\n")
 	fmt.Print("  send <message>           Exfiltrate a message via DNS TTL\r\n")
-	fmt.Print("  receive <uuid>           Recover a message using a specific UUID\r\n")
+	fmt.Print("  receive <message_id>     Recover a message using a specific message ID\r\n")
 	fmt.Print("  exit                     Exit the dnsbin shell\r\n")
 }
 

@@ -21,7 +21,7 @@ type bitRecoveredMsg struct {
 
 type receiveModel struct {
 	cfg          config.Config
-	shortUUID    string
+	messageID    string
 	expectedLen  int
 	recovered    []byte
 	bitStatus    []bool
@@ -162,7 +162,7 @@ func (m *receiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *receiveModel) View() string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\n[+] UUID: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(m.shortUUID)))
+	b.WriteString(fmt.Sprintf("\n[+] Message ID: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(m.messageID)))
 
 	if !m.headerReady {
 		b.WriteString("[*] Recovering header...\n")
@@ -250,10 +250,10 @@ func (m *receiveModel) View() string {
 	return b.String()
 }
 
-func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int) {
+func Receive(cfg config.Config, messageID string, maxChars int, concurrency int) {
 	m := &receiveModel{
 		cfg:         cfg,
-		shortUUID:   shortUUID,
+		messageID:   messageID,
 		recovered:   make([]byte, 3),
 		bitStatus:   make([]bool, 24),
 		totalBits:   24,
@@ -262,10 +262,10 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 	p := tea.NewProgram(m)
 
 	go func() {
-		baselineQuery := fmt.Sprintf("baseline.%s.%s", shortUUID, cfg.Domain)
+		baselineQuery := fmt.Sprintf("baseline.%s.%s", messageID, cfg.Domain)
 		baselineTTL, _ := utils.QueryTTL(baselineQuery, cfg.Resolver)
 		
-		endQuery := fmt.Sprintf("end.%s.%s", shortUUID, cfg.Domain)
+		endQuery := fmt.Sprintf("end.%s.%s", messageID, cfg.Domain)
 		endTTL, err := utils.QueryTTL(endQuery, cfg.Resolver)
 		if err != nil {
 			endTTL = baselineTTL
@@ -277,7 +277,7 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 			hWg.Add(1)
 			go func(pos int) {
 				defer hWg.Done()
-				query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
+				query := fmt.Sprintf("%d.%s.%s", pos, messageID, cfg.Domain)
 				ttl, err := utils.QueryTTL(query, cfg.Resolver)
 				val := 0
 				if err == nil && ttl <= endTTL {
@@ -315,7 +315,7 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 				sem <- struct{}{}
 				defer func() { <-sem }()
 
-				query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
+				query := fmt.Sprintf("%d.%s.%s", pos, messageID, cfg.Domain)
 				ttl, err := utils.QueryTTL(query, cfg.Resolver)
 				val := 0
 				if err == nil && ttl <= endTTL {
@@ -333,7 +333,7 @@ func Receive(cfg config.Config, shortUUID string, maxChars int, concurrency int)
 		// We check the header bits first
 		for i := 0; i < 24; i++ {
 			if headerBits[i] == 1 {
-				query := fmt.Sprintf("%d.%s.%s", i, shortUUID, cfg.Domain)
+				query := fmt.Sprintf("%d.%s.%s", i, messageID, cfg.Domain)
 				if ttl, err := utils.QueryTTL(query, cfg.Resolver); err == nil {
 					if lowestTTL == -1 || ttl < lowestTTL {
 						lowestTTL = ttl

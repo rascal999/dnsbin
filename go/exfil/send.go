@@ -20,7 +20,7 @@ type statsReadyMsg struct{}
 
 type sendModel struct {
 	cfg          config.Config
-	shortUUID    string
+	messageID    string
 	fullData     []byte
 	sentBits     []bool
 	totalBits    int
@@ -62,7 +62,7 @@ func (m *sendModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *sendModel) View() string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\n[+] Using UUID: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(m.shortUUID)))
+	b.WriteString(fmt.Sprintf("\n[+] Using message ID: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render(m.messageID)))
 	b.WriteString(fmt.Sprintf("[+] Message length: %d bytes\n\n", len(m.fullData)-3))
 
 	crcEnabled := (m.cfg.Options & (1 << 2)) != 0
@@ -128,7 +128,7 @@ func (m *sendModel) View() string {
 
 func Send(cfg config.Config, message string) {
 	u := uuid.New().String()
-	shortUUID := strings.Split(u, "-")[0]
+	messageID := strings.Split(u, "-")[0]
 
 	msgBytes := []byte(message)
 	msgLen := uint16(len(msgBytes))
@@ -163,7 +163,7 @@ func Send(cfg config.Config, message string) {
 	totalBits := len(fullData) * 8
 	m := &sendModel{
 		cfg:       cfg,
-		shortUUID: shortUUID,
+		messageID: messageID,
 		fullData:  fullData,
 		sentBits:  make([]bool, totalBits),
 		totalBits: totalBits,
@@ -191,7 +191,7 @@ func Send(cfg config.Config, message string) {
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
-					query := fmt.Sprintf("%d.%s.%s", pos, shortUUID, cfg.Domain)
+					query := fmt.Sprintf("%d.%s.%s", pos, messageID, cfg.Domain)
 					utils.TriggerQuery(query, cfg.Resolver)
 					p.Send(bitSentMsg(pos))
 				}(bitPos)
@@ -200,7 +200,7 @@ func Send(cfg config.Config, message string) {
 		wg.Wait()
 		m.endTime = time.Now()
 
-		endQuery := fmt.Sprintf("end.%s.%s", shortUUID, cfg.Domain)
+		endQuery := fmt.Sprintf("end.%s.%s", messageID, cfg.Domain)
 		utils.TriggerQuery(endQuery, cfg.Resolver)
 		
 		// To find the lowest TTL (first bit to expire), we check the first '1' bit sent
@@ -217,7 +217,7 @@ func Send(cfg config.Config, message string) {
 		}
 
 		if firstOnePos != -1 {
-			query := fmt.Sprintf("%d.%s.%s", firstOnePos, shortUUID, cfg.Domain)
+			query := fmt.Sprintf("%d.%s.%s", firstOnePos, messageID, cfg.Domain)
 			if ttl, err := utils.QueryTTL(query, cfg.Resolver); err == nil {
 				m.decayTime = time.Duration(ttl) * time.Second
 			}
