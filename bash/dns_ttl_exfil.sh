@@ -3,13 +3,9 @@
 # dns_ttl_exfil.sh - DNS TTL-based exfiltration and recovery
 # This script uses DNS cache TTL to determine if a bit was set (1) or not (0).
 
-#DOMAIN="synlace.io"
-#RESOLVER="@synlace.io"
-
 #dig 123abc.web.app A +noall +answer @82.96.65.2
 
 DOMAIN="web.app"
-#RESOLVER="@194.177.210.210"
 RESOLVER="@192.168.1.1"
 
 usage() {
